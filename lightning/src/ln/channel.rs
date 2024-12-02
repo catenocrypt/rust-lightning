@@ -1131,6 +1131,9 @@ pub(super) enum Channel<SP: Deref> where SP::Target: SignerProvider {
 	#[allow(dead_code)] // TODO(dual_funding): Remove once creating V2 channels is enabled.
 	UnfundedV2(PendingV2Channel<SP>),
 	Funded(FundedChannel<SP>),
+	#[cfg(splicing)]
+	/// Used during splicing, channel is funded but a new funding is being renegotiated.
+	RefundingV2(FundedChannel<SP>),
 }
 
 impl<SP: Deref> Channel<SP> where
@@ -1143,6 +1146,8 @@ impl<SP: Deref> Channel<SP> where
 			Channel::UnfundedOutboundV1(chan) => &chan.context,
 			Channel::UnfundedInboundV1(chan) => &chan.context,
 			Channel::UnfundedV2(chan) => &chan.context,
+			#[cfg(splicing)]
+			Channel::RefundingV2(chan) => &chan.context,
 		}
 	}
 
@@ -1152,6 +1157,8 @@ impl<SP: Deref> Channel<SP> where
 			Channel::UnfundedOutboundV1(ref mut chan) => &mut chan.context,
 			Channel::UnfundedInboundV1(ref mut chan) => &mut chan.context,
 			Channel::UnfundedV2(ref mut chan) => &mut chan.context,
+			#[cfg(splicing)]
+			Channel::RefundingV2(ref mut chan) => &mut chan.context,
 		}
 	}
 
@@ -1161,6 +1168,8 @@ impl<SP: Deref> Channel<SP> where
 			Channel::UnfundedOutboundV1(chan) => Some(&mut chan.unfunded_context),
 			Channel::UnfundedInboundV1(chan) => Some(&mut chan.unfunded_context),
 			Channel::UnfundedV2(chan) => Some(&mut chan.unfunded_context),
+			#[cfg(splicing)]
+			Channel::RefundingV2(_) => { debug_assert!(false); None },
 		}
 	}
 
@@ -1275,6 +1284,8 @@ impl<SP: Deref> Channel<SP> where
 				})
 			},
 			Channel::UnfundedV2(_) => None,
+			#[cfg(splicing)]
+			Channel::RefundingV2(chan) => Some(chan.signer_maybe_unblocked(logger)),
 		}
 	}
 
@@ -1284,6 +1295,8 @@ impl<SP: Deref> Channel<SP> where
 			Channel::UnfundedOutboundV1(chan) => chan.is_resumable(),
 			Channel::UnfundedInboundV1(_) => false,
 			Channel::UnfundedV2(_) => false,
+			#[cfg(splicing)]
+			Channel::RefundingV2(_) => false,
 		}
 	}
 
@@ -1321,6 +1334,8 @@ impl<SP: Deref> Channel<SP> where
 				debug_assert!(false);
 				None
 			},
+			#[cfg(splicing)]
+			Channel::RefundingV2(_) => None,
 		}
 	}
 
@@ -1353,6 +1368,8 @@ impl<SP: Deref> Channel<SP> where
 				debug_assert!(false);
 				Ok(None)
 			},
+			#[cfg(splicing)]
+			Channel::RefundingV2(_) => Ok(None),
 		}
 	}
 }
