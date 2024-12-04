@@ -56,7 +56,7 @@ use crate::chain::channelmonitor::{ChannelMonitor, ChannelMonitorUpdate, Channel
 use crate::chain::transaction::{OutPoint, TransactionData};
 use crate::sign::ecdsa::EcdsaChannelSigner;
 use crate::sign::{EntropySource, ChannelSigner, SignerProvider, NodeSigner, Recipient};
-use crate::events::{ClosureReason, Event};
+use crate::events::{ClosureReason, Event, self};
 use crate::routing::gossip::NodeId;
 use crate::util::ser::{Readable, ReadableArgs, TransactionU16LenLimited, Writeable, Writer};
 use crate::util::logger::{Logger, Record, WithContext};
@@ -1170,7 +1170,7 @@ pub(super) struct Channel<SP: Deref> where SP::Target: SignerProvider {
 	phase: Option<ChannelPhase<SP>>,
 }
 
-impl<'a, SP: Deref> Channel<SP> where SP::Target: SignerProvider {
+impl<SP: Deref> Channel<SP> where SP::Target: SignerProvider {
 	pub fn new(phase: ChannelPhase<SP>) -> Self {
 		Self {
 			phase: Some(phase),
@@ -1194,8 +1194,18 @@ impl<'a, SP: Deref> Channel<SP> where SP::Target: SignerProvider {
 		}
 	}
 
+	#[inline]
 	pub fn funded_channel(&self) -> Option<&FundedChannel<SP>> {
 		if let ChannelPhase::Funded(chan) = &self.phase.as_ref().unwrap() {
+			Some(chan)
+		} else {
+			None
+		}
+	}
+
+	#[inline]
+	pub fn funded_channel_mut(&mut self) -> Option<&mut FundedChannel<SP>> {
+		if let ChannelPhase::Funded(ref mut chan) = self.phase.as_mut().unwrap() {
 			Some(chan)
 		} else {
 			None
@@ -1230,6 +1240,84 @@ impl<'a, SP: Deref> Channel<SP> where SP::Target: SignerProvider {
 	#[inline]
 	pub fn context_mut(&mut self) -> &mut ChannelContext<SP> {
 		self.phase_mut().context_mut()
+	}
+
+	pub fn ok_to_remove_from_storage(&self) -> bool {
+		match self.phase() {
+			ChannelPhase::Funded(_) | ChannelPhase::UnfundedOutboundV1(_) => true,
+			ChannelPhase::UnfundedInboundV1(_) => false,
+			ChannelPhase::UnfundedOutboundV2(_) => true,
+			ChannelPhase::UnfundedInboundV2(_) => false,
+		}
+	}
+
+	pub fn force_shutdown(&mut self, should_broadcast: bool, closure_reason: ClosureReason) -> ShutdownResult {
+		if let Some(ref mut chan) = self.funded_channel_mut() {
+			chan.context.force_shutdown(should_broadcast, closure_reason)
+		} else {
+			self.context_mut().force_shutdown(false, closure_reason)
+		}
+	}
+
+	pub fn unfunded_channel_count(&self, best_block_height: u32) -> usize {
+		match self.phase() {
+			ChannelPhase::Funded(chan) => {
+				// This covers non-zero-conf inbound `Channel`s that we are currently monitoring, but those
+				// which have not yet had any confirmations on-chain.
+				if !chan.context.is_outbound() && chan.context.minimum_depth().unwrap_or(1) != 0 &&
+					chan.context.get_funding_tx_confirmations(best_block_height) == 0
+				{
+					return 1;
+				}
+			}
+			ChannelPhase::UnfundedInboundV1(chan) => {
+				if chan.context.minimum_depth().unwrap_or(1) != 0 {
+					return 1;
+				}
+			}
+			ChannelPhase::UnfundedInboundV2(chan) => {
+				// Only inbound V2 channels that are not 0conf and that we do not contribute to will be
+				// included in the unfunded count.
+				if chan.context.minimum_depth().unwrap_or(1) != 0 &&
+					chan.dual_funding_context.our_funding_satoshis == 0 {
+					return 1;
+				}
+			}
+			ChannelPhase::UnfundedOutboundV1(_) | ChannelPhase::UnfundedOutboundV2(_) => {
+				// Outbound channels don't contribute to the unfunded count in the DoS context.
+			}
+		}
+		0
+	}
+
+	pub fn peer_connected_get_msg<L: Deref>(&mut self, chain_hash: ChainHash, logger: &L) -> Option<events::MessageSendEvent> where L::Target: Logger {
+		match self.phase_mut() {
+			ChannelPhase::Funded(chan) => {
+				Some(events::MessageSendEvent::SendChannelReestablish {
+					node_id: chan.context.get_counterparty_node_id(),
+					msg: chan.get_channel_reestablish(logger),
+				})
+			}
+			ChannelPhase::UnfundedOutboundV1(chan) => {
+				Some(events::MessageSendEvent::SendOpenChannel {
+					node_id: chan.context.get_counterparty_node_id(),
+					msg: chan.get_open_channel(chain_hash),
+				})
+			}
+			ChannelPhase::UnfundedOutboundV2(chan) => {
+				Some(events::MessageSendEvent::SendOpenChannelV2 {
+					node_id: chan.context.get_counterparty_node_id(),
+					msg: chan.get_open_channel_v2(chain_hash),
+				})
+			}
+			ChannelPhase::UnfundedInboundV1(_) | ChannelPhase::UnfundedInboundV2(_) => {
+				// Since unfunded inbound channel maps are cleared upon disconnecting a peer,
+				// they are not persisted and won't be recovered after a crash.
+				// Therefore, they shouldn't exist at this point.
+				debug_assert!(false);
+				None
+			}
+		}
 	}
 }
 
