@@ -10438,7 +10438,7 @@ mod tests {
 	use bitcoin::amount::Amount;
 	use bitcoin::constants::ChainHash;
 	use bitcoin::script::{ScriptBuf, Builder};
-	use bitcoin::transaction::{Transaction, TxOut, Version};
+	use bitcoin::transaction::{Transaction, TxIn, TxOut, Version};
 	use bitcoin::opcodes;
 	use bitcoin::network::Network;
 	use crate::ln::onion_utils::INVALID_ONION_BLINDING;
@@ -10460,7 +10460,7 @@ mod tests {
 	use crate::routing::router::{Path, RouteHop};
 	use crate::util::config::UserConfig;
 	use crate::util::errors::APIError;
-	use crate::util::ser::{ReadableArgs, Writeable};
+	use crate::util::ser::{ReadableArgs, TransactionU16LenLimited, Writeable};
 	use crate::util::test_utils;
 	use crate::util::test_utils::{OnGetShutdownScriptpubkey, TestKeysInterface};
 	use bitcoin::secp256k1::{Secp256k1, ecdsa::Signature};
@@ -12209,5 +12209,65 @@ mod tests {
 		node_a_chan.set_batch_ready();
 		assert_eq!(node_a_chan.context.channel_state, ChannelState::AwaitingChannelReady(AwaitingChannelReadyFlags::THEIR_CHANNEL_READY));
 		assert!(node_a_chan.check_get_channel_ready(0, &&logger).is_some());
+	}
+
+	fn prepare_input(value: u64) -> (TxIn, TransactionU16LenLimited) {
+		let input_1_prev_out = TxOut { value: Amount::from_sat(value), script_pubkey: ScriptBuf::default() };
+		let input_1_prev_tx = Transaction {
+			input: vec![], output: vec![input_1_prev_out],
+			version: Version::TWO, lock_time: bitcoin::absolute::LockTime::ZERO,
+		};
+		let input_1_txin = TxIn {
+			previous_output: bitcoin::OutPoint { txid: input_1_prev_tx.compute_txid(), vout: 0 },
+			..Default::default()
+		};
+		(input_1_txin, TransactionU16LenLimited::new(input_1_prev_tx).unwrap())
+	}
+
+	#[test]
+	fn test_calculate_our_funding_satoshis() {
+		use crate::ln::channel::calculate_our_funding_satoshis;
+		use bitcoin::Weight;
+
+		let inputs_1 = [
+			prepare_input(20_000),
+		];
+		let inputs_2 = [
+			prepare_input(200_000),
+			prepare_input(100_000),
+		];
+		let witness_weight = Weight::from_wu(300);
+
+		// normal use case, output is less than the available inputs
+		assert_eq!(
+			calculate_our_funding_satoshis(true, &inputs_2, witness_weight, 2000, 1000)
+				.unwrap(),
+			298972
+		);
+
+		assert_eq!(
+			calculate_our_funding_satoshis(true, &inputs_1, witness_weight, 2000, 1000)
+				.unwrap(),
+			18972
+		);
+
+		assert_eq!(
+			calculate_our_funding_satoshis(true, &inputs_1, Weight::from_wu(0), 2000, 1000)
+				.unwrap(),
+			19572
+		);
+
+		assert_eq!(
+			calculate_our_funding_satoshis(false, &inputs_1, Weight::from_wu(0), 2000, 1000)
+				.unwrap(),
+			20000
+		);
+
+		// below dust limit
+		assert_eq!(
+			calculate_our_funding_satoshis(true, &inputs_1, witness_weight, 2000, 20_000)
+				.unwrap(),
+			0
+		);
 	}
 }
