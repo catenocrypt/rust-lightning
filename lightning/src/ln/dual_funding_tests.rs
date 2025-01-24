@@ -51,7 +51,7 @@ fn do_test_v2_channel_establishment(
 	let logger_a = test_utils::TestLogger::with_id("node a".to_owned());
 
 	// Create a funding input for the new channel along with its previous transaction.
-	let initiator_funding_inputs: Vec<_> = create_dual_funding_utxos_with_prev_txs(
+	let (initiator_funding_inputs, total_weight) = create_dual_funding_utxos_with_prev_txs(
 		&nodes[0],
 		&[session.initiator_input_value_satoshis],
 	)
@@ -66,7 +66,7 @@ fn do_test_v2_channel_establishment(
 	let funding_satoshis = calculate_our_funding_satoshis(
 		true,
 		&initiator_funding_inputs[..],
-		Weight::from_wu(P2WPKH_WITNESS_WEIGHT),
+		total_weight,
 		funding_feerate,
 		MIN_CHAN_DUST_LIMIT_SATOSHIS,
 	)
