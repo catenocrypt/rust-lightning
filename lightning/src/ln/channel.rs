@@ -57,6 +57,7 @@ use crate::chain::transaction::{OutPoint, TransactionData};
 use crate::sign::ecdsa::EcdsaChannelSigner;
 use crate::sign::{EntropySource, ChannelSigner, SignerProvider, NodeSigner, Recipient};
 use crate::events::{ClosureReason, Event};
+use crate::events::bump_transaction::BASE_INPUT_WEIGHT;
 use crate::routing::gossip::NodeId;
 use crate::util::ser::{Readable, ReadableArgs, TransactionU16LenLimited, Writeable, Writer};
 use crate::util::logger::{Logger, Record, WithContext};
@@ -4354,7 +4355,6 @@ pub(super) fn calculate_our_funding_satoshis(
 	holder_dust_limit_satoshis: u64,
 ) -> Result<u64, APIError> {
 	let mut total_input_satoshis = 0u64;
-	let mut our_contributed_weight = 0u64;
 
 	for (idx, input) in funding_inputs.iter().enumerate() {
 		if let Some(output) = input.1.as_transaction().output.get(input.0.previous_output.vout as usize) {
@@ -4365,6 +4365,9 @@ pub(super) fn calculate_our_funding_satoshis(
 					input.1.as_transaction().compute_txid(), input.0.previous_output.vout, idx) });
 		}
 	}
+	// inputs:
+	let mut our_contributed_weight = (funding_inputs.len() as u64) * BASE_INPUT_WEIGHT;
+	// witnesses:
 	our_contributed_weight = our_contributed_weight.saturating_add(total_witness_weight.to_wu());
 
 	// If we are the initiator, we must pay for weight of all common fields in the funding transaction.
@@ -12242,25 +12245,25 @@ mod tests {
 		assert_eq!(
 			calculate_our_funding_satoshis(true, &inputs_2, witness_weight, 2000, 1000)
 				.unwrap(),
-			298972
+			298332
 		);
 
 		assert_eq!(
 			calculate_our_funding_satoshis(true, &inputs_1, witness_weight, 2000, 1000)
 				.unwrap(),
-			18972
+			18652
 		);
 
 		assert_eq!(
 			calculate_our_funding_satoshis(true, &inputs_1, Weight::from_wu(0), 2000, 1000)
 				.unwrap(),
-			19572
+			19252
 		);
 
 		assert_eq!(
 			calculate_our_funding_satoshis(false, &inputs_1, Weight::from_wu(0), 2000, 1000)
 				.unwrap(),
-			20000
+			19680
 		);
 
 		// below dust limit
