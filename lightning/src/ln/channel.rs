@@ -54,8 +54,9 @@ use crate::chain::chaininterface::{FeeEstimator, ConfirmationTarget, LowerBounde
 use crate::chain::channelmonitor::{ChannelMonitor, ChannelMonitorUpdate, ChannelMonitorUpdateStep, LATENCY_GRACE_PERIOD_BLOCKS};
 use crate::chain::transaction::{OutPoint, TransactionData};
 use crate::sign::ecdsa::EcdsaChannelSigner;
-use crate::sign::{EntropySource, ChannelSigner, SignerProvider, NodeSigner, Recipient};
+use crate::sign::{EntropySource, ChannelSigner, SignerProvider, NodeSigner, Recipient, P2WPKH_WITNESS_WEIGHT};
 use crate::events::{ClosureReason, Event};
+use crate::events::bump_transaction::BASE_INPUT_WEIGHT;
 use crate::routing::gossip::NodeId;
 use crate::util::ser::{Readable, ReadableArgs, TransactionU16LenLimited, Writeable, Writer};
 use crate::util::logger::{Logger, Record, WithContext};
@@ -4552,15 +4553,44 @@ fn get_v2_channel_reserve_satoshis(channel_value_satoshis: u64, dust_limit_satos
 	cmp::min(channel_value_satoshis, cmp::max(q, dust_limit_satoshis))
 }
 
+/// Estimate our part of the fee of the new funding transaction.
+/// input_count: Number of contributed inputs.
+/// witness_weight: The witness weight for contributed inputs.
+#[allow(dead_code)] // TODO(dual_funding): Remove once V2 channels is enabled.
+fn estimate_funding_transaction_fee(
+	is_initiator: bool, input_count: usize, witness_weight: Weight,
+	funding_feerate_sat_per_1000_weight: u32,
+) -> u64 {
+	// Inputs
+	let mut weight = (input_count as u64) * BASE_INPUT_WEIGHT;
+
+	// Witnesses
+	weight = weight.saturating_add(witness_weight.to_wu());
+
+	// If we are the initiator, we must pay for weight of all common fields in the funding transaction.
+	if is_initiator {
+		weight = weight
+			.saturating_add(TX_COMMON_FIELDS_WEIGHT)
+			// The weight of the funding output, a P2WSH output
+			// NOTE: The witness script hash given here is irrelevant as it's a fixed size and we just want
+			// to calculate the contributed weight, so we use an all-zero hash.
+			.saturating_add(get_output_weight(&ScriptBuf::new_p2wsh(
+				&WScriptHash::from_raw_hash(Hash::all_zeros())
+			)).to_wu())
+	}
+
+	fee_for_weight(funding_feerate_sat_per_1000_weight, weight)
+}
+
 #[allow(dead_code)] // TODO(dual_funding): Remove once V2 channels is enabled.
 pub(super) fn calculate_our_funding_satoshis(
 	is_initiator: bool, funding_inputs: &[(TxIn, TransactionU16LenLimited)],
 	total_witness_weight: Weight, funding_feerate_sat_per_1000_weight: u32,
 	holder_dust_limit_satoshis: u64,
 ) -> Result<u64, APIError> {
-	let mut total_input_satoshis = 0u64;
-	let mut our_contributed_weight = 0u64;
+	let estimated_fee = estimate_funding_transaction_fee(is_initiator, funding_inputs.len(), total_witness_weight, funding_feerate_sat_per_1000_weight);
 
+	let mut total_input_satoshis = 0u64;
 	for (idx, input) in funding_inputs.iter().enumerate() {
 		if let Some(output) = input.1.as_transaction().output.get(input.0.previous_output.vout as usize) {
 			total_input_satoshis = total_input_satoshis.saturating_add(output.value.to_sat());
@@ -4570,23 +4600,8 @@ pub(super) fn calculate_our_funding_satoshis(
 					input.1.as_transaction().compute_txid(), input.0.previous_output.vout, idx) });
 		}
 	}
-	our_contributed_weight = our_contributed_weight.saturating_add(total_witness_weight.to_wu());
 
-	// If we are the initiator, we must pay for weight of all common fields in the funding transaction.
-	if is_initiator {
-		our_contributed_weight = our_contributed_weight
-			.saturating_add(TX_COMMON_FIELDS_WEIGHT)
-			// The weight of a P2WSH output to be added later.
-			//
-			// NOTE: The witness script hash given here is irrelevant as it's a fixed size and we just want
-			// to calculate the contributed weight, so we use an all-zero hash.
-			.saturating_add(get_output_weight(&ScriptBuf::new_p2wsh(
-				&WScriptHash::from_raw_hash(Hash::all_zeros())
-			)).to_wu())
-	}
-
-	let funding_satoshis = total_input_satoshis
-		.saturating_sub(fee_for_weight(funding_feerate_sat_per_1000_weight, our_contributed_weight));
+	let funding_satoshis = total_input_satoshis.saturating_sub(estimated_fee);
 	if funding_satoshis < holder_dust_limit_satoshis {
 		Ok(0)
 	} else {
@@ -8241,10 +8256,21 @@ impl<SP: Deref> FundedChannel<SP> where
 
 		// Pre-check that inputs are sufficient to cover our contribution.
 		// Note: fees are not taken into account here.
-		let sum_input: i64 = our_funding_inputs.into_iter().map(
-			|(txin, tx)| tx.output.get(txin.previous_output.vout as usize).map(|tx| tx.value.to_sat() as i64).unwrap_or(0)
+		let sum_input: u64 = our_funding_inputs.iter().map(
+			|(txin, tx)| tx.output.get(txin.previous_output.vout as usize).map(|tx| tx.value.to_sat()).unwrap_or(0)
 		).sum();
-		if sum_input < our_funding_contribution_satoshis {
+
+		// The +1 is to include the input of the old funding
+		let funding_input_count = our_funding_inputs.len() + 1;
+		// Add weight for inputs (estimated as P2WPKH) *and* spending old funding
+		let total_witness_weight = Weight::from_wu(
+			our_funding_inputs.len() as u64 * P2WPKH_WITNESS_WEIGHT +
+			2 * P2WPKH_WITNESS_WEIGHT
+		);
+		let estimated_fee = estimate_funding_transaction_fee(true, funding_input_count, total_witness_weight, funding_feerate_per_kw);
+		let available_input = sum_input.saturating_sub(estimated_fee);
+
+		if (available_input as i64) < our_funding_contribution_satoshis {
 			return Err(ChannelError::Warn(format!(
 				"Provided inputs are insufficient for our contribution, {} {}",
 				sum_input, our_funding_contribution_satoshis,
