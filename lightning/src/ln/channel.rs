@@ -4469,14 +4469,44 @@ fn get_v2_channel_reserve_satoshis(channel_value_satoshis: u64, dust_limit_satos
 	cmp::min(channel_value_satoshis, cmp::max(q, dust_limit_satoshis))
 }
 
+/// Estimate our part of the fee of the new funding transaction.
+/// input_count: Number of contributed inputs.
+/// witness_weight: The witness weight for contributed inputs.
+#[allow(dead_code)] // TODO(dual_funding): Remove once V2 channels is enabled.
+fn estimate_v2_funding_transaction_fee(
+	is_initiator: bool, input_count: usize, witness_weight: Weight,
+	funding_feerate_sat_per_1000_weight: u32,
+) -> u64 {
+	// Inputs
+	let mut weight = (input_count as u64) * BASE_INPUT_WEIGHT;
+
+	// Witnesses
+	weight = weight.saturating_add(witness_weight.to_wu());
+
+	// If we are the initiator, we must pay for weight of all common fields in the funding transaction.
+	if is_initiator {
+		weight = weight
+			.saturating_add(TX_COMMON_FIELDS_WEIGHT)
+			// The weight of the funding output, a P2WSH output
+			// NOTE: The witness script hash given here is irrelevant as it's a fixed size and we just want
+			// to calculate the contributed weight, so we use an all-zero hash.
+			.saturating_add(get_output_weight(&ScriptBuf::new_p2wsh(
+				&WScriptHash::from_raw_hash(Hash::all_zeros())
+			)).to_wu())
+	}
+
+	fee_for_weight(funding_feerate_sat_per_1000_weight, weight)
+}
+
 #[allow(dead_code)] // TODO(dual_funding): Remove once V2 channels is enabled.
 pub(super) fn calculate_our_funding_satoshis(
 	is_initiator: bool, funding_inputs: &[(TxIn, TransactionU16LenLimited)],
 	total_witness_weight: Weight, funding_feerate_sat_per_1000_weight: u32,
 	holder_dust_limit_satoshis: u64,
 ) -> Result<u64, APIError> {
-	let mut total_input_satoshis = 0u64;
+	let estimated_fee = estimate_v2_funding_transaction_fee(is_initiator, funding_inputs.len(), total_witness_weight, funding_feerate_sat_per_1000_weight);
 
+	let mut total_input_satoshis = 0u64;
 	for (idx, input) in funding_inputs.iter().enumerate() {
 		if let Some(output) = input.1.as_transaction().output.get(input.0.previous_output.vout as usize) {
 			total_input_satoshis = total_input_satoshis.saturating_add(output.value.to_sat());
@@ -4486,26 +4516,8 @@ pub(super) fn calculate_our_funding_satoshis(
 					input.1.as_transaction().compute_txid(), input.0.previous_output.vout, idx) });
 		}
 	}
-	// inputs:
-	let mut our_contributed_weight = (funding_inputs.len() as u64) * BASE_INPUT_WEIGHT;
-	// witnesses:
-	our_contributed_weight = our_contributed_weight.saturating_add(total_witness_weight.to_wu());
 
-	// If we are the initiator, we must pay for weight of all common fields in the funding transaction.
-	if is_initiator {
-		our_contributed_weight = our_contributed_weight
-			.saturating_add(TX_COMMON_FIELDS_WEIGHT)
-			// The weight of a P2WSH output to be added later.
-			//
-			// NOTE: The witness script hash given here is irrelevant as it's a fixed size and we just want
-			// to calculate the contributed weight, so we use an all-zero hash.
-			.saturating_add(get_output_weight(&ScriptBuf::new_p2wsh(
-				&WScriptHash::from_raw_hash(Hash::all_zeros())
-			)).to_wu())
-	}
-
-	let funding_satoshis = total_input_satoshis
-		.saturating_sub(fee_for_weight(funding_feerate_sat_per_1000_weight, our_contributed_weight));
+	let funding_satoshis = total_input_satoshis.saturating_sub(estimated_fee);
 	if funding_satoshis < holder_dust_limit_satoshis {
 		Ok(0)
 	} else {
@@ -12240,6 +12252,42 @@ mod tests {
 		assert!(node_a_chan.check_get_channel_ready(0, &&logger).is_some());
 	}
 
+	#[test]
+	fn test_estimate_v2_funding_transaction_fee() {
+		use crate::ln::channel::estimate_v2_funding_transaction_fee;
+		use bitcoin::Weight;
+
+		// 2 inputs with weight 300, initiator, 2000 sat/kw feerate
+		assert_eq!(
+			estimate_v2_funding_transaction_fee(true, 2, Weight::from_wu(300), 2000),
+			1668
+		);
+
+		// higher feerate
+		assert_eq!(
+			estimate_v2_funding_transaction_fee(true, 2, Weight::from_wu(300), 3000),
+			2502
+		);
+
+		// only 1 input
+		assert_eq!(
+			estimate_v2_funding_transaction_fee(true, 1, Weight::from_wu(300), 2000),
+			1348
+		);
+
+		// 0 input weight
+		assert_eq!(
+			estimate_v2_funding_transaction_fee(true, 1, Weight::from_wu(0), 2000),
+			748
+		);
+
+		// not initiator
+		assert_eq!(
+			estimate_v2_funding_transaction_fee(false, 1, Weight::from_wu(0), 2000),
+			320
+		);
+	}
+
 	fn funding_input_sats(input_value_sats: u64) -> (TxIn, TransactionU16LenLimited) {
 		let input_1_prev_out = TxOut { value: Amount::from_sat(input_value_sats), script_pubkey: ScriptBuf::default() };
 		let input_1_prev_tx = Transaction {
@@ -12271,39 +12319,6 @@ mod tests {
 				1000,
 			).unwrap(),
 			298332
-		);
-
-		assert_eq!(
-			calculate_our_funding_satoshis(
-				true,
-				&[funding_input_sats(20_000)],
-				Weight::from_wu(300),
-				2000,
-				1000,
-			).unwrap(),
-			18652
-		);
-
-		assert_eq!(
-			calculate_our_funding_satoshis(
-				true,
-				&[funding_input_sats(20_000)],
-				Weight::from_wu(0),
-				2000,
-				1000,
-			).unwrap(),
-			19252
-		);
-
-		assert_eq!(
-			calculate_our_funding_satoshis(
-				false,
-				&[funding_input_sats(20_000)],
-				Weight::from_wu(0),
-				2000,
-				1000,
-			).unwrap(),
-			19680
 		);
 
 		// below dust limit
