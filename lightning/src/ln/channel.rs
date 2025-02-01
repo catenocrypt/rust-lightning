@@ -4559,7 +4559,7 @@ fn get_v2_channel_reserve_satoshis(channel_value_satoshis: u64, dust_limit_satos
 /// input_count: Number of contributed inputs.
 /// witness_weight: The witness weight for contributed inputs.
 #[allow(dead_code)] // TODO(dual_funding): Remove once V2 channels is enabled.
-fn estimate_funding_transaction_fee(
+fn estimate_v2_funding_transaction_fee(
 	is_initiator: bool, input_count: usize, witness_weight: Weight,
 	funding_feerate_sat_per_1000_weight: u32,
 ) -> u64 {
@@ -4590,7 +4590,7 @@ pub(super) fn calculate_our_funding_satoshis(
 	total_witness_weight: Weight, funding_feerate_sat_per_1000_weight: u32,
 	holder_dust_limit_satoshis: u64,
 ) -> Result<u64, APIError> {
-	let estimated_fee = estimate_funding_transaction_fee(is_initiator, funding_inputs.len(), total_witness_weight, funding_feerate_sat_per_1000_weight);
+	let estimated_fee = estimate_v2_funding_transaction_fee(is_initiator, funding_inputs.len(), total_witness_weight, funding_feerate_sat_per_1000_weight);
 
 	let mut total_input_satoshis = 0u64;
 	for (idx, input) in funding_inputs.iter().enumerate() {
@@ -8219,10 +8219,11 @@ impl<SP: Deref> FundedChannel<SP> where
 	}
 
 	/// Initiate splicing.
-	/// - witness_weight: The witness weight for contributed inputs.
+	/// - our_funding_inputs: the inputs we contribute to the new funding transaction.
+	///   Includes the witness weight for this input (e.g. P2WPKH_WITNESS_WEIGHT=109 for typical P2WPKH inputs).
 	#[cfg(splicing)]
 	pub fn splice_channel(&mut self, our_funding_contribution_satoshis: i64,
-		our_funding_inputs: Vec<(TxIn, Transaction)>, witness_weight: Weight,
+		our_funding_inputs: Vec<(TxIn, Transaction, Weight)>,
 		funding_feerate_per_kw: u32, locktime: u32,
 	) -> Result<msgs::SpliceInit, ChannelError> {
 		// Check if a splice has been initiated already.
@@ -8261,16 +8262,17 @@ impl<SP: Deref> FundedChannel<SP> where
 		// Pre-check that inputs are sufficient to cover our contribution.
 		// Note: fees are not taken into account here.
 		let sum_input: u64 = our_funding_inputs.iter().map(
-			|(txin, tx)| tx.output.get(txin.previous_output.vout as usize).map(|tx| tx.value.to_sat()).unwrap_or(0)
+			|(txin, tx, _)| tx.output.get(txin.previous_output.vout as usize).map(|tx| tx.value.to_sat()).unwrap_or(0)
 		).sum();
 
 		// The +1 is to include the input of the old funding
 		let funding_input_count = our_funding_inputs.len() + 1;
 		// Input witness weight, extended with weight for spending old funding
 		let total_witness_weight = Weight::from_wu(
-			witness_weight.to_wu().saturating_add(FUNDING_TRANSACTION_WITNESS_WEIGHT)
+			our_funding_inputs.iter().map(|(_, _, w)| w.to_wu()).sum::<u64>()
+			.saturating_add(FUNDING_TRANSACTION_WITNESS_WEIGHT)
 		);
-		let estimated_fee = estimate_funding_transaction_fee(true, funding_input_count, total_witness_weight, funding_feerate_per_kw);
+		let estimated_fee = estimate_v2_funding_transaction_fee(true, funding_input_count, total_witness_weight, funding_feerate_per_kw);
 		let available_input = sum_input.saturating_sub(estimated_fee);
 
 		if (available_input as i64) < our_funding_contribution_satoshis {
@@ -9504,6 +9506,7 @@ impl<SP: Deref> PendingV2Channel<SP> where SP::Target: SignerProvider {
 
 	/// Creates a new dual-funded channel from a remote side's request for one.
 	/// Assumes chain_hash has already been checked and corresponds with what we expect!
+	/// TODO(dual_funding): Include witness weight info with the inputs.
 	#[allow(dead_code)] // TODO(dual_funding): Remove once V2 channels is enabled.
 	pub fn new_inbound<ES: Deref, F: Deref, L: Deref>(
 		fee_estimator: &LowerBoundedFeeEstimator<F>, entropy_source: &ES, signer_provider: &SP,
@@ -12494,6 +12497,43 @@ mod tests {
 		node_a_chan.set_batch_ready();
 		assert_eq!(node_a_chan.context.channel_state, ChannelState::AwaitingChannelReady(AwaitingChannelReadyFlags::THEIR_CHANNEL_READY));
 		assert!(node_a_chan.check_get_channel_ready(0, &&logger).is_some());
+	}
+
+
+	#[test]
+	fn test_estimate_v2_funding_transaction_fee() {
+		use crate::ln::channel::estimate_v2_funding_transaction_fee;
+		use bitcoin::Weight;
+
+		// 2 inputs with weight 300, initiator, 2000 sat/kw feerate
+		assert_eq!(
+			estimate_v2_funding_transaction_fee(true, 2, Weight::from_wu(300), 2000),
+			1668
+		);
+
+		// higher feerate
+		assert_eq!(
+			estimate_v2_funding_transaction_fee(true, 2, Weight::from_wu(300), 3000),
+			2502
+		);
+
+		// only 1 input
+		assert_eq!(
+			estimate_v2_funding_transaction_fee(true, 1, Weight::from_wu(300), 2000),
+			1348
+		);
+
+		// 0 input weight
+		assert_eq!(
+			estimate_v2_funding_transaction_fee(true, 1, Weight::from_wu(0), 2000),
+			748
+		);
+
+		// not initiator
+		assert_eq!(
+			estimate_v2_funding_transaction_fee(false, 1, Weight::from_wu(0), 2000),
+			320
+		);
 	}
 
 	#[cfg(all(test, splicing))]
